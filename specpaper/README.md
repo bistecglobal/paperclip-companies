@@ -63,16 +63,18 @@ paperclipai company import --from /path/to/specpaper --dry-run
 
 ### 3. Configure secrets
 
-In Paperclip Settings → Secrets, create:
+In Paperclip Settings → Secrets, create at minimum:
 
-| Secret name | Holds | Used by |
-|---|---|---|
-| `anthropic_api_key` | Anthropic API key | CEO, CTO, devops, verifier, e2e-tester (default provider) |
-| `minimax_api_key` | Minimax API key (Anthropic-compatible endpoint) | builder, builder-dotnet, builder-nextjs |
-| `discord_guild_id` | Your Discord server ID | CEO bootstrap |
-| `discord_projects_category_id` | Discord category ID where project channels are created | CEO bootstrap |
-| `azure_devops_pat` (per-project) | Azure DevOps PAT | tracker-sync.sh on AzDo projects |
-| `github_token` (per-project) | GitHub token | tracker-sync.sh on GitHub projects |
+| Secret name | Required | Holds | Used by |
+|---|---|---|---|
+| `anthropic_api_key` | yes | Anthropic API key | All agents (default provider) |
+| `discord_guild_id` | yes | Your Discord server ID | CEO bootstrap |
+| `discord_projects_category_id` | yes | Discord category ID for project channels | CEO bootstrap |
+| `minimax_api_key` | optional | Minimax API key (Anthropic-compatible endpoint) | Builders, only after opting in |
+| `azure_devops_pat` | per-project | Azure DevOps PAT | tracker-sync.sh on AzDo projects |
+| `github_token` | per-project | GitHub token | tracker-sync.sh on GitHub projects |
+
+**All agents default to Anthropic direct.** Minimax routing is opt-in via a script after import (see [Cost optimization](#cost-optimization-minimax-routing)).
 
 ## Usage
 
@@ -153,15 +155,45 @@ The verifier audits this section against the diff.
 
 ## Cost optimization (Minimax routing)
 
-By default, builders route through Minimax's Anthropic-compatible endpoint (Haiku-class model) for ~5-10× cost reduction on high-volume implementation work. CEO, CTO, devops, verifier, and e2e-tester stay on Anthropic direct (Sonnet) for quality-sensitive roles.
+All agents default to **Anthropic direct**. Minimax routing is **opt-in** for builders so the company imports cleanly without requiring the `minimax_api_key` secret up front.
 
-Before flipping any agent, run the pre-flight test:
+### Workflow
 
-```bash
-bash skills/specpaper/scripts/llm-pricing-probe.sh <change-name>
-```
+1. **Validate Minimax compatibility** with the pre-flight test:
+   ```bash
+   bash skills/specpaper/scripts/llm-pricing-probe.sh <change-name>
+   ```
+   Runs a deterministic 5-task synthetic build through both providers and compares cost + failure rate. See `DESIGN.md` for the caveat list (prompt-cache compatibility, stream-JSON parsing, `--resume` semantics).
 
-This runs a deterministic 5-task build through both providers and compares cost + failure rate. See `DESIGN.md` for the caveat list (prompt-cache compatibility, stream-JSON parsing, `--resume` semantics).
+2. **Create the `minimax_api_key` secret** in Paperclip Settings → Secrets.
+
+3. **Opt the builders in:**
+   ```bash
+   # Opt in all three builders at once
+   bash skills/specpaper/scripts/configure-llm-routing.sh enable-minimax --all-builders
+
+   # Or one at a time
+   bash skills/specpaper/scripts/configure-llm-routing.sh enable-minimax builder-dotnet
+   ```
+
+   The script verifies `minimax_api_key` exists in Paperclip *before* patching the agent configs. If the secret is missing, it errors with instructions and changes nothing.
+
+4. **Inspect the current routing:**
+   ```bash
+   bash skills/specpaper/scripts/configure-llm-routing.sh status
+   ```
+
+5. **Revert to Anthropic direct** if the probe regresses or you change your mind:
+   ```bash
+   bash skills/specpaper/scripts/configure-llm-routing.sh disable-minimax --all-builders
+   ```
+
+### Recommended routing matrix
+
+| Agent | Default | Opt-in option |
+|---|---|---|
+| CEO, CTO, devops, verifier, e2e-tester | Anthropic direct (Sonnet / Opus) | — |
+| builder, builder-dotnet, builder-nextjs | Anthropic direct (Sonnet) | Minimax (Haiku-class) for cost |
 
 ## Adding a new specialist
 

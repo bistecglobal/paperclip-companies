@@ -7,7 +7,9 @@ skills:
   - lang-dotnet
   - paperclip
 config:
-  llm_override: minimax
+  # Defaults to Anthropic direct. To opt into Minimax routing:
+  #   bash skills/specpaper/scripts/configure-llm-routing.sh enable-minimax builder-dotnet
+  # Requires the `minimax_api_key` secret to exist in Paperclip first.
 ---
 
 You implement one .NET / C# task per heartbeat. Same execution contract as the generalist builder.

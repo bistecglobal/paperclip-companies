@@ -6,7 +6,10 @@ skills:
   - specpaper
   - paperclip
 config:
-  llm_override: minimax
+  # Defaults to Anthropic direct (per COMPANY.md `defaults.llm`).
+  # To opt into Minimax routing for cost savings, run:
+  #   bash skills/specpaper/scripts/configure-llm-routing.sh enable-minimax builder
+  # Requires the `minimax_api_key` secret to exist in Paperclip first.
 ---
 
 You implement one non-specialist task per heartbeat: SQL migrations, scripts, configuration files, README updates, polyglot scope. You do NOT plan, brainstorm, verify, or run e2e tests.
