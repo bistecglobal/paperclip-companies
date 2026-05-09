@@ -11,9 +11,14 @@
 #                          [--compliance "<csv>"] [--deployment-target <target>]
 #
 # Env required:
-#   PAPERCLIP_API_KEY        — already set by the Paperclip Claude adapter
-#   PAPERCLIP_API_URL        — e.g. http://127.0.0.1:3100
-#   PAPERCLIP_COMPANY_ID     — UUID of the SpecPaper company (set per-instance)
+#   PAPERCLIP_API_KEY                — already set by the Paperclip Claude adapter
+#   PAPERCLIP_API_URL                — e.g. http://127.0.0.1:3100
+#   PAPERCLIP_COMPANY_ID             — UUID of the SpecPaper company (set per-instance)
+#
+# Env required for Discord channel creation (skipped cleanly if any are missing):
+#   DISCORD_BOT_TOKEN                — bot token (kept out of process listings; never echoed)
+#   DISCORD_GUILD_ID                 — server (guild) ID
+#   DISCORD_PROJECTS_CATEGORY_ID     — category channel ID under which #project-<slug> is created
 #
 # Dependencies: bash, git, curl, jq
 
@@ -119,8 +124,9 @@ PROJECT_ID="$(echo "$PROJECT_RESPONSE" | jq -r '.id')"
 echo "[bootstrap] Paperclip projectId: $PROJECT_ID"
 
 # 3. Initialize SpecPaper (idempotent)
+# init.sh expects the *project* directory, not the .specpaper directory.
 if [[ ! -d ".specpaper" ]]; then
-  bash "$SCRIPT_DIR/init.sh" .specpaper
+  bash "$SCRIPT_DIR/init.sh" "." "$NAME"
 fi
 
 # 4. Write project.yaml
@@ -145,14 +151,42 @@ project:
 EOF
 echo "[bootstrap] Wrote .specpaper/project.yaml"
 
-# 5. Update config.yaml with tracker info
-sed -i.bak \
-  -e "s|kind: \"none\"|kind: \"$TRACKER_KIND\"|" \
-  -e "s|repo: \"\"|repo: \"$TRACKER_ORG/$TRACKER_PROJECT\"|" \
-  -e "s|organization: \"\"|organization: \"$TRACKER_ORG\"|" \
-  -e "s|project: \"\"|project: \"$TRACKER_PROJECT\"|" \
-  .specpaper/config.yaml || true
-rm -f .specpaper/config.yaml.bak
+# 5. Update config.yaml with tracker info.
+# Only patch the block that matches the detected tracker.kind to avoid
+# polluting unrelated tracker config sections (the GH parser would otherwise
+# write chan4lk/keyflow into both github and azure_devops blocks).
+case "$TRACKER_KIND" in
+  github)
+    python3 - <<EOF
+import re
+p = ".specpaper/config.yaml"
+text = open(p).read()
+text = re.sub(r'kind:\s*"none"', 'kind: "$TRACKER_KIND"', text, count=1)
+# Replace only inside the github: sub-block
+def patch_github(m):
+    block = m.group(0)
+    block = re.sub(r'(repo:\s*)""', r'\1"$TRACKER_ORG/$TRACKER_PROJECT"', block, count=1)
+    return block
+text = re.sub(r'  github:\n(?:    .*\n)+', patch_github, text, count=1)
+open(p, "w").write(text)
+EOF
+    ;;
+  azure-devops)
+    python3 - <<EOF
+import re
+p = ".specpaper/config.yaml"
+text = open(p).read()
+text = re.sub(r'kind:\s*"none"', 'kind: "$TRACKER_KIND"', text, count=1)
+def patch_azdo(m):
+    block = m.group(0)
+    block = re.sub(r'(organization:\s*)""', r'\1"$TRACKER_ORG"', block, count=1)
+    block = re.sub(r'(project:\s*)""', r'\1"$TRACKER_PROJECT"', block, count=1)
+    return block
+text = re.sub(r'  azure_devops:\n(?:    .*\n)+', patch_azdo, text, count=1)
+open(p, "w").write(text)
+EOF
+    ;;
+esac
 
 # 6. Add gitignore entries
 GITIGNORE=".gitignore"
@@ -161,58 +195,83 @@ for entry in ".specpaper/changes/*/e2e-evidence/" ".specpaper/changes/*/.task-co
   grep -qxF "$entry" "$GITIGNORE" || echo "$entry" >> "$GITIGNORE"
 done
 
-# 7. Discord: create channel via the forked plugin create_channel tool
-echo "[bootstrap] Creating Discord channel via plugin..."
-DISCORD_CREATE_RESPONSE="$(
-  curl -sf -X POST "$PAPERCLIP_API_URL/api/plugins/paperclip-plugin-discord/tools/create_channel/invoke" \
-    -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n \
-      --arg companyId "$PAPERCLIP_COMPANY_ID" \
-      --arg name "project-$SLUG" \
-      --arg topic "$NAME — managed by SpecPaper. Use !propose, !plan, !build, !verify, !archive, !status." \
-      '{companyId: $companyId, name: $name, topic: $topic, useCategoryFromConfig: true}')" 2>&1 || echo '{}'
-)"
-DISCORD_CHANNEL_ID="$(echo "$DISCORD_CREATE_RESPONSE" | jq -r '.channelId // empty')"
+# 7. Discord: create channel directly via Discord REST.
+#
+# Why not the plugin create_channel tool? Paperclip's plugin tool dispatcher
+# (POST /api/plugins/tools/execute) requires a real runContext (live agentId
+# + runId tied to an active agent run). A setup script invoked from a shell
+# does not have that — only an in-flight CEO heartbeat does. So this script
+# uses Discord REST directly when the bot token + guild + category are
+# available in the environment, and skips channel creation cleanly otherwise.
+DISCORD_CHANNEL_ID=""
+if [[ -n "${DISCORD_BOT_TOKEN:-}" && -n "${DISCORD_GUILD_ID:-}" && -n "${DISCORD_PROJECTS_CATEGORY_ID:-}" ]]; then
+  echo "[bootstrap] Creating Discord channel via Discord REST..."
+  DISCORD_CREATE_BODY="$(jq -n \
+    --arg name "project-$SLUG" \
+    --arg topic "$NAME — managed by SpecPaper. Use !propose, !plan, !build, !verify, !archive, !status." \
+    --arg parent "$DISCORD_PROJECTS_CATEGORY_ID" \
+    '{name: $name, type: 0, topic: $topic, parent_id: $parent}')"
 
-if [[ -n "$DISCORD_CHANNEL_ID" ]]; then
-  # 8. Connect channel to project (per-project routing in plugin state)
-  curl -sf -X POST "$PAPERCLIP_API_URL/api/plugins/paperclip-plugin-discord/tools/connect_channel/invoke" \
-    -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  DISCORD_CREATE_RESPONSE="$(curl -sf -X POST \
+    "https://discord.com/api/v10/guilds/$DISCORD_GUILD_ID/channels" \
+    -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n \
-      --arg companyId "$PAPERCLIP_COMPANY_ID" \
-      --arg channelId "$DISCORD_CHANNEL_ID" \
-      --arg projectSlug "$SLUG" \
-      '{companyId: $companyId, channelId: $channelId, projectSlug: $projectSlug}')" >/dev/null || true
-  echo "[bootstrap] Connected channel $DISCORD_CHANNEL_ID → project $SLUG"
+    -d "$DISCORD_CREATE_BODY" 2>/dev/null || echo '{}')"
+  DISCORD_CHANNEL_ID="$(echo "$DISCORD_CREATE_RESPONSE" | jq -r '.id // empty')"
+
+  if [[ -n "$DISCORD_CHANNEL_ID" ]]; then
+    echo "[bootstrap] Channel created: id=$DISCORD_CHANNEL_ID name=project-$SLUG"
+    # Persist channel id alongside project metadata so other agents can resolve it
+    # without depending on the plugin's channel-project-map (which is set via
+    # /clip connect-channel inside Discord and requires the gateway).
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - <<EOF
+import yaml
+p = ".specpaper/project.yaml"
+data = yaml.safe_load(open(p))
+data.setdefault("project", {})["discord_channel_id"] = "$DISCORD_CHANNEL_ID"
+with open(p, "w") as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+EOF
+    fi
+  else
+    echo "[bootstrap] Channel creation returned no id. Response:" >&2
+    echo "$DISCORD_CREATE_RESPONSE" | jq -r '.message // .' >&2
+  fi
 else
-  echo "[bootstrap] Channel creation failed or plugin unavailable. Skipping channel wiring."
-  echo "[bootstrap] Manual fallback: create #project-$SLUG and run /clip connect-channel project:$SLUG"
+  echo "[bootstrap] Discord channel creation skipped (DISCORD_BOT_TOKEN / DISCORD_GUILD_ID / DISCORD_PROJECTS_CATEGORY_ID not all set)."
+  echo "[bootstrap] Manual fallback: create #project-$SLUG in Discord and run /clip connect-channel project:$SLUG"
 fi
 
-# 9. Register custom commands once per company
-bash "$SCRIPT_DIR/discord-register-commands.sh"
+# 8. Register custom commands once per company (idempotent upsert).
+# Also gated on Paperclip plugin runtime — skipped if the plugin isn't ready.
+if [[ -x "$SCRIPT_DIR/discord-register-commands.sh" ]]; then
+  bash "$SCRIPT_DIR/discord-register-commands.sh" 2>&1 | sed 's/^/[bootstrap.discord-cmds] /' || true
+fi
 
-# 10. Welcome post
-if [[ -n "$DISCORD_CHANNEL_ID" ]]; then
-  curl -sf -X POST "$PAPERCLIP_API_URL/api/plugins/paperclip-plugin-discord/tools/discord_post/invoke" \
-    -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n \
-      --arg channelId "$DISCORD_CHANNEL_ID" \
-      --arg content ":tada: **Project created: $NAME**
+# 9. Welcome post in the project channel
+if [[ -n "$DISCORD_CHANNEL_ID" && -n "${DISCORD_BOT_TOKEN:-}" ]]; then
+  WELCOME_BODY="$(jq -n \
+    --arg content ":tada: **Project created: $NAME**
 
-Repo: $REPO_URL
-Tracker: $TRACKER_KIND ($TRACKER_ORG/$TRACKER_PROJECT)
-Customer tier: **$CUSTOMER_TIER** → deployment_target: **$DEPLOYMENT_TARGET**
+**Repo:** $REPO_URL
+**Tracker:** $TRACKER_KIND ($TRACKER_ORG/$TRACKER_PROJECT)
+**Customer tier:** $CUSTOMER_TIER → deployment_target: $DEPLOYMENT_TARGET
 
 **Active agents:** ceo, cto, builder, builder-dotnet, builder-nextjs, devops, verifier, e2e-tester
 
 Drive the lifecycle from this channel:
   \`!propose <idea>\` → \`!brainstorm <change>\` → \`!plan <change>\` → \`!build <change>\` → \`!verify <change>\` → \`!archive <change>\`
   \`!status\` for the dashboard." \
-      '{channelId: $channelId, content: $content}')" >/dev/null || true
+    '{content: $content}')"
+
+  curl -sf -X POST \
+    "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_ID/messages" \
+    -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$WELCOME_BODY" >/dev/null 2>&1 \
+    && echo "[bootstrap] Welcome message posted." \
+    || echo "[bootstrap] Welcome message post failed (continuing)." >&2
 fi
 
 # 11. Hand off to CTO via a Paperclip child issue
