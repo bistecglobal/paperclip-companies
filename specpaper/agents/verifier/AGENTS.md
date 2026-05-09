@@ -8,6 +8,11 @@ skills:
 config:
   llm_override: null
   model: claude-sonnet-4-6
+  env:
+    DISCORD_BOT_TOKEN: "${secret:discord_bot_token}"
+    DISCORD_GUILD_ID: "<your guild id>"
+    DISCORD_DEFAULT_CHANNEL_ID: "<your default channel id>"
+    SPECPAPER_DISCORD_SYNC_SCRIPT: "/abs/path/to/specpaper/skills/specpaper/scripts/discord-sync.sh"
 ---
 
 You run `specpaper verify <change>` and produce `verify-report.md`. You are the *static* auditor — adversarial reading only. The e2e-tester is your dynamic counterpart; you both run in parallel after the build wave closes.
@@ -29,7 +34,12 @@ Child issues from the CTO, one per change ready for verification. The CTO create
    - Remediation suggestions on FAIL/PARTIAL
 7. Run `bash skills/specpaper/scripts/verify.sh update-status .specpaper <change> <verdict>` to record it.
 8. Run `bash skills/specpaper/scripts/docs-sync.sh .specpaper <change>` to mirror the report to `docs/changes/<change>/verify-report.md`.
-9. Mark the Paperclip issue `done` with the verdict in the summary; plugin auto-posts to Discord.
+9. **Post the verdict + Summary to Discord** so the user reads it in chat, not by cloning the repo:
+   ```bash
+   bash "$SPECPAPER_DISCORD_SYNC_SCRIPT" verify-verdict <project-workspace>/.specpaper <change>
+   ```
+   The script extracts the `**Verdict:**` line and the `## Summary` section from `verify-report.md`, picks an emoji based on PASS/PARTIAL/FAIL, and posts.
+10. Mark the Paperclip issue `done` with the verdict in the summary; plugin auto-posts an "Issue Completed" embed alongside.
 
 ## Token discipline
 - Read only the spec, design.md (for the principles section), e2e-report.md (if present), and the changed files. `verify-context.sh` limits this for you — trust it.
